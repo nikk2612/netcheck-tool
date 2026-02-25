@@ -1,62 +1,82 @@
 #!/usr/bin/env python3
 """
-NetCheck - Windows-friendly network preflight tuned for:
-  - Printers (9100/raw, 631/IPP, 80/443)
-  - 3D Printers / OctoPrint (80, 5000, 8080)
-  - Servers / Switches (22, 23, 443, 161/NOTE_UDP)
+NetCheck (lean) — Windows-friendly network checks + persistent inventory CSV.
 
-Features:
-- DNS forward + reverse check
-- ICMP ping (uses platform ping)
-- Parallel checks across targets
-- TCP port check + optional banner/title grabs for HTTP/SSH
-- Optional traceroute (uses tracert on Windows)
-- Exports CSV and Markdown
+Each run:
+- Check ONE device (--target) OR many from a file (--input)
+- DNS resolve (best effort) + reverse lookup (best effort)
+- Ping
+- TCP port connect checks
+- Update ONE inventory CSV:
+  - add new devices
+  - update existing devices
+  - set last_checked timestamp
+  - sort so most recently checked are at the TOP
+
+Key design choices:
+- device_key uses HOSTNAME as the source of truth when available.
+  This prevents duplicate entries if the IP changes over time.
+- inventory writes are atomic (write .tmp then os.replace()).
+- TCP timeout is derived from --timeout to avoid false negatives on slower networks.
 """
 
 from __future__ import annotations
+
 import argparse
 import csv
+import os
 import platform
 import socket
 import subprocess
 import sys
 import time
-import re
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-# ---------- Configuration: default ports for each device-type ----------
-DEFAULT_PORTS = {
-    "printers": [9100, 631, 80, 443],           # raw printing, IPP, web UI
-    "3dprinters": [80, 5000, 8080],             # OctoPrint (5000), web UIs
-    "servers_switches": [22, 23, 443, 161],     # SSH, Telnet, HTTPS, SNMP (UDP note)
+
+# ---- Port presets tuned for your environment ----
+PORT_PRESETS: Dict[str, List[int]] = {
+    "printers": [9100, 631, 80, 443],
+    "3dprinters": [80, 5000, 8080],
+    "servers_switches": [22, 443, 23],
+    "mixed": [9100, 631, 80, 443, 5000, 8080, 22, 23],
 }
-# Flatten default ports into a sensible default order for general checks:
-DEFAULT_FLATTENED = sorted({p for plist in DEFAULT_PORTS.values() for p in plist})
 
-# ---------- Data model ----------
+# ---- Minimal CSV schema ----
+FIELDS = [
+    "device_key",     # hostname (preferred) or ip if hostname unknown
+    "input_target",   # what you typed / what was in the file
+    "hostname",       # normalized hostname if provided
+    "ip",
+    "reverse_dns",
+    "ping_ok",
+    "rtt_ms",
+    "open_ports",
+    "notes",
+    "first_seen",
+    "last_checked",
+]
+
+
 @dataclass
-class CheckResult:
-    target: str
-    resolved_ip: str
-    reverse_name: str
-    dns_ok: bool
+class Result:
+    input_target: str
+    hostname: str
+    ip: str
+    reverse_dns: str
     ping_ok: bool
     rtt_ms: str
     open_ports: str
-    closed_ports: str
-    http_title: str
-    ssh_banner: str
     notes: str
 
-# ---------- Utilities ----------
+
 def read_targets(path: Path) -> List[str]:
-    raw = path.read_text(encoding="utf-8").splitlines()
-    targets = [line.strip() for line in raw if line.strip() and not line.strip().startswith("#")]
-    return targets
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
 
 def is_ip(s: str) -> bool:
     try:
@@ -65,241 +85,237 @@ def is_ip(s: str) -> bool:
     except Exception:
         return False
 
-def dns_lookup(target: str) -> (str, str, bool, str):
-    try:
-        if is_ip(target):
-            ip = target
-            try:
-                rev = socket.gethostbyaddr(ip)[0]
-                return ip, rev, True, ""
-            except Exception as e:
-                return ip, "", False, f"Reverse DNS failed: {e}"
-        else:
-            ip = socket.gethostbyname(target)
-            rev = ""
-            ok = True
-            err = ""
-            try:
-                rev = socket.gethostbyaddr(ip)[0]
-            except Exception as e:
-                ok = False
-                err = f"Reverse DNS failed: {e}"
-            return ip, rev, ok, err
-    except Exception as e:
-        return "", "", False, f"DNS lookup failed: {e}"
 
-def ping(ip: str, timeout_s: int = 2) -> (bool, str, str):
+def normalize_hostname(s: str) -> str:
+    return s.strip().lower()
+
+
+def resolve(target: str) -> Tuple[str, str, str, str]:
+    """
+    Returns (hostname, ip, reverse_dns, note)
+    - If target is hostname: hostname=normalized target, attempt DNS to get ip
+    - If target is IP: hostname="", ip=target
+    Reverse DNS is best-effort.
+    """
+    t = target.strip()
+    hostname = "" if is_ip(t) else normalize_hostname(t)
+
+    ip = ""
+    try:
+        ip = t if is_ip(t) else socket.gethostbyname(t)
+    except Exception as e:
+        return hostname, "", "", f"DNS resolve failed: {e}"
+
+    rev = ""
+    try:
+        rev = socket.gethostbyaddr(ip)[0]
+    except Exception:
+        pass
+
+    return hostname, ip, rev, ""
+
+
+def ping(ip: str, timeout_s: int) -> Tuple[bool, str, str]:
+    """
+    Returns (ok, rtt_ms_best_effort, note)
+    Uses platform ping:
+      Windows: ping -n 1 -w <ms>
+    RTT here is "wall clock" for the ping command (lean + consistent).
+    """
     if not ip:
         return False, "", "No IP"
-    system = platform.system().lower()
-    if system == "windows":
+
+    sysname = platform.system().lower()
+    if sysname == "windows":
         cmd = ["ping", "-n", "1", "-w", str(timeout_s * 1000), ip]
-    elif system == "darwin":
-        cmd = ["ping", "-c", "1", "-W", str(timeout_s * 1000), ip]
     else:
         cmd = ["ping", "-c", "1", "-W", str(timeout_s), ip]
+
     try:
         start = time.time()
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.run(cmd, capture_output=True, text=True)
         elapsed_ms = int((time.time() - start) * 1000)
-        if proc.returncode == 0:
+        if p.returncode == 0:
             return True, str(elapsed_ms), ""
-        else:
-            # try to parse RTT from output if possible (best-effort)
-            out = proc.stdout + proc.stderr
-            m = re.search(r'time[=<]\s*([\d\.]+)\s*ms', out)
-            if m:
-                return True, m.group(1), ""
-            return False, "", (proc.stderr or proc.stdout).strip()
+        return False, "", (p.stderr or p.stdout).strip()
     except Exception as e:
         return False, "", str(e)
 
-def tcp_port_check_with_banner(ip: str, port: int, timeout_s: float = 1.0) -> (bool, str):
-    """
-    Attempts TCP connect; for certain ports try to read banner or HTTP title.
-    Returns (is_open, banner_or_title)
-    """
+
+def tcp_open(ip: str, port: int, timeout_s: float) -> bool:
     try:
-        with socket.create_connection((ip, port), timeout=timeout_s) as s:
-            s.settimeout(timeout_s)
-            banner = ""
-            # SSH (22) banner grab
-            if port == 22:
-                try:
-                    banner = s.recv(256).decode(errors="ignore").strip()
-                except Exception:
-                    banner = ""
-            # HTTP-like ports: send a simple HEAD to get a response/title
-            if port in (80, 443, 8080, 5000):
-                try:
-                    # If TLS (443) we'd need ssl.wrap_socket; instead we send HOST header and hope redirect/response helps on non-TLS admin pages.
-                    req = "HEAD / HTTP/1.0\r\nHost: {}\r\n\r\n".format(ip)
-                    s.sendall(req.encode())
-                    resp = s.recv(4096).decode(errors="ignore")
-                    # try to extract <title> if any
-                    m = re.search(r"<title>(.*?)</title>", resp, re.IGNORECASE | re.DOTALL)
-                    if m:
-                        banner = m.group(1).strip()
-                    else:
-                        # fallback: extract Server header or first line
-                        lines = resp.splitlines()
-                        for L in lines[:10]:
-                            if "Server:" in L or "HTTP/" in L:
-                                banner = L.strip()
-                                break
-                except Exception:
-                    pass
-            return True, banner
+        with socket.create_connection((ip, port), timeout=timeout_s):
+            return True
     except Exception:
-        return False, ""
+        return False
 
-def traceroute_cmd(ip: str, max_hops: int = 12) -> (bool, str):
-    system = platform.system().lower()
-    if system == "windows":
-        cmd = ["tracert", "-h", str(max_hops), ip]
-    else:
-        cmd = ["traceroute", "-m", str(max_hops), ip]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-        ok = proc.returncode == 0
-        out = (proc.stdout or proc.stderr or "").strip()
-        return ok, out
-    except Exception as e:
-        return False, f"Traceroute error: {e}"
 
-# ---------- Worker logic (per-target) ----------
-def check_target(target: str, ports: List[int], ping_timeout: int) -> (CheckResult, str):
-    ip, rev, dns_ok, dns_err = dns_lookup(target)
-    ping_ok, rtt_ms, ping_err = ping(ip, timeout_s=ping_timeout) if ip else (False, "", "No IP")
-    open_ports = []
-    closed_ports = []
-    http_titles = []
-    ssh_banner = ""
-    notes = ""
+def make_device_key(hostname: str, ip: str) -> str:
+    """
+    Hostname-first keying:
+    - If hostname exists, it is the unique ID (stable across IP changes).
+    - If you provided only an IP, key by IP.
+    """
+    return hostname if hostname else ip
 
-    for p in ports:
-        # We will try TCP port check; note: port 161 is normally UDP (SNMP) — TCP check may not be meaningful.
-        is_open, banner = tcp_port_check_with_banner(ip, p, timeout_s=1.0) if ip else (False, "")
-        if is_open:
-            open_ports.append(str(p))
-            if p in (80, 8080, 5000, 443):
-                if banner:
-                    http_titles.append(f"{p}:{banner}")
-            if p == 22 and banner:
-                ssh_banner = banner
-        else:
-            closed_ports.append(str(p))
 
-    if not ip:
-        notes = dns_err or "Could not resolve"
-    elif not dns_ok:
-        notes = dns_err
-    elif not ping_ok:
-        notes = f"Ping failed: {ping_err}"
+def check_one(target: str, ports: List[int], ping_timeout: int, tcp_timeout: float) -> Result:
+    hostname, ip, rev, note = resolve(target)
+    ping_ok, rtt_ms, ping_note = ping(ip, ping_timeout) if ip else (False, "", "No IP")
 
-    result = CheckResult(
-        target=target,
-        resolved_ip=ip,
-        reverse_name=rev,
-        dns_ok=dns_ok,
+    open_ports: List[str] = []
+    if ip:
+        for p in ports:
+            if tcp_open(ip, p, tcp_timeout):
+                open_ports.append(str(p))
+
+    notes = note
+    if not notes and not ping_ok:
+        notes = f"Ping failed: {ping_note}"
+
+    return Result(
+        input_target=target.strip(),
+        hostname=hostname,
+        ip=ip,
+        reverse_dns=rev,
         ping_ok=ping_ok,
         rtt_ms=rtt_ms,
         open_ports=",".join(open_ports),
-        closed_ports=",".join(closed_ports),
-        http_title=" | ".join(http_titles),
-        ssh_banner=ssh_banner,
-        notes=notes
+        notes=notes,
     )
-    return result, ""  # second return reserved for trace text when invoked externally
 
-# ---------- Output helpers ----------
-def to_csv(results: List[CheckResult], path: Path):
-    if not results:
-        return
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(asdict(results[0]).keys()))
-        w.writeheader()
-        for r in results:
-            w.writerow(asdict(r))
 
-def to_markdown(results: List[CheckResult], ports: List[int], traces: Dict[str,str], include_trace: bool) -> str:
-    lines = []
-    lines.append("# NetCheck Report\n")
-    lines.append(f"Checked ports: {', '.join(map(str, ports)) if ports else 'None'}  \n")
-    lines.append("| Target | IP | DNS OK | Ping | RTT (ms) | Open Ports | HTTP Titles | SSH Banner | Notes |")
-    lines.append("|---|---:|:---:|:---:|---:|---|---|---|---|")
+def load_inventory(path: Path) -> Dict[str, Dict[str, str]]:
+    """
+    Load existing inventory keyed by device_key.
+    Backward compatible: if device_key missing, rebuild it hostname-first.
+    """
+    if not path.exists():
+        return {}
+
+    inv: Dict[str, Dict[str, str]] = {}
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            dk = (row.get("device_key") or "").strip()
+            hostname = (row.get("hostname") or "").strip().lower()
+            ip = (row.get("ip") or "").strip()
+
+            if not dk:
+                dk = make_device_key(hostname, ip)
+                row["device_key"] = dk
+
+            inv[dk] = row
+    return inv
+
+
+def upsert(inv: Dict[str, Dict[str, str]], results: List[Result]) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     for r in results:
-        lines.append(f"| {r.target} | {r.resolved_ip} | {'✅' if r.dns_ok else '❌'} | {'✅' if r.ping_ok else '❌'} | {r.rtt_ms or ''} | {r.open_ports or ''} | {r.http_title or ''} | {r.ssh_banner or ''} | {r.notes or ''} |")
-    if include_trace:
-        lines.append("\n## Traceroutes\n")
-        for t, txt in traces.items():
-            lines.append(f"### {t}\n")
-            lines.append("```")
-            lines.append(txt)
-            lines.append("```")
-    lines.append("")
-    return "\n".join(lines)
+        dk = make_device_key(r.hostname, r.ip)
+        if not dk:
+            # If we couldn't resolve at all, fall back to input target as last resort
+            dk = normalize_hostname(r.input_target) if not is_ip(r.input_target) else r.input_target.strip()
 
-# ---------- Main ----------
-def main():
-    ap = argparse.ArgumentParser(description="NetCheck - Windows-friendly preflight checks (printers, 3D printers, servers/switches).")
-    ap.add_argument("--input", required=True, help="Path to file with targets (one hostname or IP per line).")
-    ap.add_argument("--device-type", choices=["printers","3dprinters","servers_switches","mixed"], default="mixed",
-                    help="Choose default port set tuned for your devices. 'mixed' uses a combined default.")
-    ap.add_argument("--ports", nargs="*", type=int, default=None, help="Explicit list of ports to check (overrides device-type).")
-    ap.add_argument("--timeout", type=int, default=2, help="Ping timeout seconds (default: 2).")
-    ap.add_argument("--csv", default="", help="Optional CSV output path.")
-    ap.add_argument("--md", default="", help="Optional Markdown output path.")
-    ap.add_argument("--trace", action="store_true", help="Include traceroute (slower).")
-    ap.add_argument("--workers", type=int, default=10, help="Number of parallel workers (default: 10).")
+        row = inv.get(dk)
+        if row is None:
+            row = {c: "" for c in FIELDS}
+            row["device_key"] = dk
+            row["first_seen"] = now
+            inv[dk] = row
+
+        row["input_target"] = r.input_target
+        row["hostname"] = r.hostname
+        row["ip"] = r.ip
+        row["reverse_dns"] = r.reverse_dns
+        row["ping_ok"] = str(r.ping_ok)
+        row["rtt_ms"] = r.rtt_ms
+        row["open_ports"] = r.open_ports
+        row["notes"] = r.notes
+        row["last_checked"] = now
+
+
+def write_inventory_atomic(path: Path, inv: Dict[str, Dict[str, str]]) -> None:
+    """
+    Atomic write:
+    - write to path.tmp
+    - os.replace(tmp, path) so you never end up with a half-written inventory
+    Sorted by last_checked desc so most recently checked are at the top.
+    """
+    rows = list(inv.values())
+
+    def parse_ts(s: str) -> datetime:
+        try:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return datetime.min
+
+    rows.sort(key=lambda row: parse_ts(row.get("last_checked", "")), reverse=True)
+
+    tmp_path = Path(str(path) + ".tmp")
+    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        w.writeheader()
+        for row in rows:
+            w.writerow({c: row.get(c, "") for c in FIELDS})
+
+    os.replace(tmp_path, path)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="NetCheck (lean) - persistent CSV inventory for quick checks.")
+    ap.add_argument("--target", help="Single hostname/IP.")
+    ap.add_argument("--input", help="File with targets (one per line).")
+    ap.add_argument("--preset", choices=list(PORT_PRESETS.keys()), default="mixed", help="Port preset to use.")
+    ap.add_argument("--ports", nargs="*", type=int, help="Explicit ports (overrides preset).")
+    ap.add_argument("--timeout", type=int, default=2, help="Ping timeout seconds (also influences TCP timeout).")
+    ap.add_argument("--tcp-timeout", type=float, default=0.0,
+                    help="TCP connect timeout seconds (default: derived from --timeout).")
+    ap.add_argument("--workers", type=int, default=12, help="Parallel workers for file input.")
+    ap.add_argument("--inventory", default="netcheck_inventory.csv", help="Inventory CSV path.")
     args = ap.parse_args()
 
-    targets = read_targets(Path(args.input))
-    if not targets:
-        print("No targets found in", args.input, file=sys.stderr)
+    if args.target:
+        targets = [args.target.strip()]
+    elif args.input:
+        targets = read_targets(Path(args.input))
+    else:
+        print("Provide --target <host/ip> or --input <file>", file=sys.stderr)
         return 2
 
-    if args.ports:
-        ports = args.ports
+    if not targets:
+        print("No targets to check.", file=sys.stderr)
+        return 2
+
+    ports = args.ports if args.ports else PORT_PRESETS[args.preset]
+
+    # TCP timeout: tie it to ping timeout to avoid false negatives on slower links.
+    # Rule of thumb: ~50% of ping timeout, with a minimum floor.
+    tcp_timeout = args.tcp_timeout if args.tcp_timeout > 0 else max(0.8, args.timeout * 0.5)
+
+    results: List[Result] = []
+    if len(targets) == 1:
+        results.append(check_one(targets[0], ports, args.timeout, tcp_timeout))
     else:
-        if args.device_type == "mixed":
-            ports = DEFAULT_FLATTENED
-        else:
-            ports = DEFAULT_PORTS[args.device_type]
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(check_one, t, ports, args.timeout, tcp_timeout): t for t in targets}
+            for fut in as_completed(futs):
+                results.append(fut.result())
 
-    results = []
-    traces = {}
+    inv_path = Path(args.inventory)
+    inv = load_inventory(inv_path)
+    upsert(inv, results)
+    write_inventory_atomic(inv_path, inv)
 
-    print(f"Checking {len(targets)} targets with ports: {ports} (workers={args.workers})")
+    # Print what you just checked (these will be the newest rows in the CSV)
+    for r in results:
+        key = make_device_key(r.hostname, r.ip) or r.input_target
+        print(f"{key} -> {r.ip} | ping={'OK' if r.ping_ok else 'NO'} | open={r.open_ports or '-'} | {r.notes}")
 
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        future_to_target = {ex.submit(check_target, t, ports, args.timeout): t for t in targets}
-        for fut in as_completed(future_to_target):
-            t = future_to_target[fut]
-            try:
-                res, _ = fut.result()
-                results.append(res)
-                # Optionally do traceroute serially (slower) if requested
-                if args.trace and res.resolved_ip:
-                    ok, tr = traceroute_cmd(res.resolved_ip)
-                    traces[t] = tr
-                # Provide brief console status line
-                print(f"[{len(results)}/{len(targets)}] {res.target} -> {res.resolved_ip} ping:{'OK' if res.ping_ok else 'NO'} open:{res.open_ports or 'none'}")
-            except Exception as e:
-                print(f"Error checking {t}: {e}", file=sys.stderr)
-
-    # write CSV & Markdown
-    if args.csv:
-        to_csv(results, Path(args.csv))
-        print("Wrote CSV:", args.csv)
-    md_text = to_markdown(results, ports, traces, args.trace)
-    if args.md:
-        Path(args.md).write_text(md_text, encoding="utf-8")
-        print("Wrote Markdown:", args.md)
-    else:
-        print(md_text)
-
+    print(f"Updated: {inv_path} (tracked devices: {len(inv)})")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
