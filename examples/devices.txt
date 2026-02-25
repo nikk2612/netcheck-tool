@@ -1,0 +1,11 @@
+# Printers (examples)
+printer-1.example.local
+192.168.10.45
+
+# 3D printers (OctoPrint / lab)
+octoprint-lab1.example.local
+192.168.30.12
+
+# Switches / servers
+core-switch-1.example.local
+10.10.0.12
