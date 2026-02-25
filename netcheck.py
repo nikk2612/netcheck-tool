@@ -2,22 +2,27 @@
 """
 NetCheck (lean) — Windows-friendly network checks + persistent inventory CSV.
 
-Each run:
-- Check ONE device (--target) OR many from a file (--input)
+Usage:
+  Single target (positional):
+    python netcheck.py 192.168.1.50
+    python netcheck.py printer-23 --preset printers
+
+  Batch file:
+    python netcheck.py --input devices.txt
+
+What it does:
 - DNS resolve (best effort) + reverse lookup (best effort)
 - Ping
 - TCP port connect checks
-- Update ONE inventory CSV:
+- Update ONE inventory CSV (atomic write):
   - add new devices
   - update existing devices
   - set last_checked timestamp
   - sort so most recently checked are at the TOP
 
-Key design choices:
-- device_key uses HOSTNAME as the source of truth when available.
-  This prevents duplicate entries if the IP changes over time.
-- inventory writes are atomic (write .tmp then os.replace()).
-- TCP timeout is derived from --timeout to avoid false negatives on slower networks.
+Design choices:
+- device_key uses HOSTNAME as source of truth when available (prevents duplicates if IP changes).
+- TCP timeout derived from --timeout (helps avoid false negatives on slower links).
 """
 
 from __future__ import annotations
@@ -47,7 +52,7 @@ PORT_PRESETS: Dict[str, List[int]] = {
 
 # ---- Minimal CSV schema ----
 FIELDS = [
-    "device_key",     # hostname (preferred) or ip if hostname unknown
+    "device_key",     # hostname preferred, IP fallback
     "input_target",   # what you typed / what was in the file
     "hostname",       # normalized hostname if provided
     "ip",
@@ -93,7 +98,7 @@ def normalize_hostname(s: str) -> str:
 def resolve(target: str) -> Tuple[str, str, str, str]:
     """
     Returns (hostname, ip, reverse_dns, note)
-    - If target is hostname: hostname=normalized target, attempt DNS to get ip
+    - If target is hostname: hostname=normalized target, DNS -> ip
     - If target is IP: hostname="", ip=target
     Reverse DNS is best-effort.
     """
@@ -118,9 +123,7 @@ def resolve(target: str) -> Tuple[str, str, str, str]:
 def ping(ip: str, timeout_s: int) -> Tuple[bool, str, str]:
     """
     Returns (ok, rtt_ms_best_effort, note)
-    Uses platform ping:
-      Windows: ping -n 1 -w <ms>
-    RTT here is "wall clock" for the ping command (lean + consistent).
+    RTT is measured as wall-clock runtime of the ping command (lean + consistent).
     """
     if not ip:
         return False, "", "No IP"
@@ -151,11 +154,7 @@ def tcp_open(ip: str, port: int, timeout_s: float) -> bool:
 
 
 def make_device_key(hostname: str, ip: str) -> str:
-    """
-    Hostname-first keying:
-    - If hostname exists, it is the unique ID (stable across IP changes).
-    - If you provided only an IP, key by IP.
-    """
+    # Hostname-first to avoid duplicates when IP changes (common in internal networks).
     return hostname if hostname else ip
 
 
@@ -186,10 +185,6 @@ def check_one(target: str, ports: List[int], ping_timeout: int, tcp_timeout: flo
 
 
 def load_inventory(path: Path) -> Dict[str, Dict[str, str]]:
-    """
-    Load existing inventory keyed by device_key.
-    Backward compatible: if device_key missing, rebuild it hostname-first.
-    """
     if not path.exists():
         return {}
 
@@ -215,7 +210,7 @@ def upsert(inv: Dict[str, Dict[str, str]], results: List[Result]) -> None:
     for r in results:
         dk = make_device_key(r.hostname, r.ip)
         if not dk:
-            # If we couldn't resolve at all, fall back to input target as last resort
+            # If nothing resolved, last resort key = input
             dk = normalize_hostname(r.input_target) if not is_ip(r.input_target) else r.input_target.strip()
 
         row = inv.get(dk)
@@ -237,12 +232,6 @@ def upsert(inv: Dict[str, Dict[str, str]], results: List[Result]) -> None:
 
 
 def write_inventory_atomic(path: Path, inv: Dict[str, Dict[str, str]]) -> None:
-    """
-    Atomic write:
-    - write to path.tmp
-    - os.replace(tmp, path) so you never end up with a half-written inventory
-    Sorted by last_checked desc so most recently checked are at the top.
-    """
     rows = list(inv.values())
 
     def parse_ts(s: str) -> datetime:
@@ -253,25 +242,32 @@ def write_inventory_atomic(path: Path, inv: Dict[str, Dict[str, str]]) -> None:
 
     rows.sort(key=lambda row: parse_ts(row.get("last_checked", "")), reverse=True)
 
-    tmp_path = Path(str(path) + ".tmp")
-    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
         w.writeheader()
         for row in rows:
             w.writerow({c: row.get(c, "") for c in FIELDS})
 
-    os.replace(tmp_path, path)
+    os.replace(tmp, path)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="NetCheck (lean) - persistent CSV inventory for quick checks.")
-    ap.add_argument("--target", help="Single hostname/IP.")
+    ap.add_argument("target", nargs="?", help="Single hostname/IP (positional).")
     ap.add_argument("--input", help="File with targets (one per line).")
+
     ap.add_argument("--preset", choices=list(PORT_PRESETS.keys()), default="mixed", help="Port preset to use.")
     ap.add_argument("--ports", nargs="*", type=int, help="Explicit ports (overrides preset).")
+
     ap.add_argument("--timeout", type=int, default=2, help="Ping timeout seconds (also influences TCP timeout).")
-    ap.add_argument("--tcp-timeout", type=float, default=0.0,
-                    help="TCP connect timeout seconds (default: derived from --timeout).")
+    ap.add_argument(
+        "--tcp-timeout",
+        type=float,
+        default=0.0,
+        help="TCP connect timeout seconds (default: derived from --timeout).",
+    )
+
     ap.add_argument("--workers", type=int, default=12, help="Parallel workers for file input.")
     ap.add_argument("--inventory", default="netcheck_inventory.csv", help="Inventory CSV path.")
     args = ap.parse_args()
@@ -281,7 +277,7 @@ def main() -> int:
     elif args.input:
         targets = read_targets(Path(args.input))
     else:
-        print("Provide --target <host/ip> or --input <file>", file=sys.stderr)
+        print("Provide a hostname/IP or --input <file>", file=sys.stderr)
         return 2
 
     if not targets:
@@ -289,9 +285,6 @@ def main() -> int:
         return 2
 
     ports = args.ports if args.ports else PORT_PRESETS[args.preset]
-
-    # TCP timeout: tie it to ping timeout to avoid false negatives on slower links.
-    # Rule of thumb: ~50% of ping timeout, with a minimum floor.
     tcp_timeout = args.tcp_timeout if args.tcp_timeout > 0 else max(0.8, args.timeout * 0.5)
 
     results: List[Result] = []
@@ -308,11 +301,21 @@ def main() -> int:
     upsert(inv, results)
     write_inventory_atomic(inv_path, inv)
 
-    # Print what you just checked (these will be the newest rows in the CSV)
     for r in results:
-        key = make_device_key(r.hostname, r.ip) or r.input_target
-        print(f"{key} -> {r.ip} | ping={'OK' if r.ping_ok else 'NO'} | open={r.open_ports or '-'} | {r.notes}")
+    key = make_device_key(r.hostname, r.ip) or r.input_target
 
+    if r.ping_ok and not r.open_ports:
+        port_msg = "no tested ports accessible"
+    else:
+        port_msg = r.open_ports if r.open_ports else "-"
+
+    print(
+        f"{key} -> {r.ip} | "
+        f"ping={'OK' if r.ping_ok else 'NO'} | "
+        f"ports={port_msg} | "
+        f"{r.notes}"
+    )
+    
     print(f"Updated: {inv_path} (tracked devices: {len(inv)})")
     return 0
 
