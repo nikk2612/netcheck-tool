@@ -302,20 +302,20 @@ def main() -> int:
     write_inventory_atomic(inv_path, inv)
 
     for r in results:
-    key = make_device_key(r.hostname, r.ip) or r.input_target
+        key = make_device_key(r.hostname, r.ip) or r.input_target
 
-    if r.ping_ok and not r.open_ports:
-        port_msg = "no tested ports accessible"
-    else:
-        port_msg = r.open_ports if r.open_ports else "-"
+        if r.ping_ok and not r.open_ports:
+            port_msg = "no tested ports accessible"
+        else:
+            port_msg = r.open_ports if r.open_ports else "-"
 
-    print(
-        f"{key} -> {r.ip} | "
-        f"ping={'OK' if r.ping_ok else 'NO'} | "
-        f"ports={port_msg} | "
-        f"{r.notes}"
-    )
-    
+        print(
+            f"{key} -> {r.ip} | "
+            f"ping={'OK' if r.ping_ok else 'NO'} | "
+            f"ports={port_msg} | "
+            f"{r.notes}"
+        )
+
     print(f"Updated: {inv_path} (tracked devices: {len(inv)})")
     return 0
 
