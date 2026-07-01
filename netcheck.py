@@ -23,6 +23,11 @@ What it does:
 Design choices:
 - device_key uses HOSTNAME as source of truth when available (prevents duplicates if IP changes).
 - TCP timeout derived from --timeout (helps avoid false negatives on slower links).
+
+UNDER CONSTRUCTION:
+- --web-check is an experimental side feature (generic HTML scrape of the device's
+  web UI for status/error keywords). Not wired into any preset by default, not yet
+  tested against real devices. Use at your own pace.
 """
 
 from __future__ import annotations
@@ -31,10 +36,13 @@ import argparse
 import csv
 import os
 import platform
+import re
 import socket
+import ssl
 import subprocess
 import sys
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -50,6 +58,20 @@ PORT_PRESETS: Dict[str, List[int]] = {
     "mixed": [9100, 631, 80, 443, 5000, 8080, 22, 23],
 }
 
+# ---- Best-effort web UI status scrape (generic, no per-brand parsing) ----
+# UNDER CONSTRUCTION: experimental, opt-in via --web-check, not yet validated against real devices.
+WEB_PORTS = (443, 80)  # tried in this order when open
+
+WEB_ERROR_KEYWORDS = [
+    "error", "jam", "toner low", "toner empty", "no toner", "out of paper",
+    "add paper", "cover open", "cover is open", "call service", "service required",
+    "attention required", "replace toner", "fuser error", "offline",
+]
+WEB_OK_KEYWORDS = ["ready", "printing", "standby", "sleep", "idle", "normal", "online"]
+
+# Loosely matches things like "Error 123", "Err: E4-01", "SC541" across arbitrary vendor pages.
+ERROR_CODE_RE = re.compile(r"\b(?:err(?:or)?|code|sc)[\s:#-]*([a-z]?-?\d{2,5}(?:-\d{2,4})?)\b", re.IGNORECASE)
+
 # ---- Minimal CSV schema ----
 FIELDS = [
     "device_key",     # hostname preferred, IP fallback
@@ -60,6 +82,8 @@ FIELDS = [
     "ping_ok",
     "rtt_ms",
     "open_ports",
+    "web_status",     # "" (not checked), "ok", "error", "unknown", "unreachable"
+    "web_error_code",
     "notes",
     "first_seen",
     "last_checked",
@@ -76,6 +100,8 @@ class Result:
     rtt_ms: str
     open_ports: str
     notes: str
+    web_status: str = ""
+    web_error_code: str = ""
 
 
 def read_targets(path: Path) -> List[str]:
@@ -153,12 +179,63 @@ def tcp_open(ip: str, port: int, timeout_s: float) -> bool:
         return False
 
 
+def fetch_web_page(ip: str, port: int, timeout_s: float) -> str:
+    """Best-effort GET of the device's root web page. Raises on any failure."""
+    scheme = "https" if port == 443 else "http"
+    url = f"{scheme}://{ip}/"
+    # Embedded web UIs (printers, switches) almost always use self-signed certs.
+    ctx = ssl._create_unverified_context() if scheme == "https" else None
+    req = urllib.request.Request(url, headers={"User-Agent": "NetCheck/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:
+        raw = resp.read(200_000)  # cap read size, status pages are small
+    return raw.decode("utf-8", errors="ignore")
+
+
+def check_web_status(ip: str, open_ports: List[str], timeout_s: float) -> Tuple[str, str]:
+    """
+    Generic best-effort scrape of the device's web UI to catch obvious error states.
+    Tries HTTPS then HTTP on whichever of those ports were seen open (WEB_PORTS).
+    Returns (web_status, web_error_code); web_status is "" if no web port applies.
+    """
+    if not ip:
+        return "", ""
+
+    candidates = [p for p in WEB_PORTS if str(p) in open_ports]
+    if not candidates:
+        return "", ""
+
+    for port in candidates:
+        try:
+            body = fetch_web_page(ip, port, timeout_s)
+        except Exception:
+            continue  # try the next candidate port instead of failing outright
+
+        lower = body.lower()
+        code_match = ERROR_CODE_RE.search(lower)
+        error_code = code_match.group(1).upper() if code_match else ""
+
+        if any(kw in lower for kw in WEB_ERROR_KEYWORDS):
+            return "error", error_code
+        if any(kw in lower for kw in WEB_OK_KEYWORDS):
+            return "ok", ""
+        return "unknown", error_code  # page loaded but nothing recognizable
+
+    return "unreachable", ""
+
+
 def make_device_key(hostname: str, ip: str) -> str:
     # Hostname-first to avoid duplicates when IP changes (common in internal networks).
     return hostname if hostname else ip
 
 
-def check_one(target: str, ports: List[int], ping_timeout: int, tcp_timeout: float) -> Result:
+def check_one(
+    target: str,
+    ports: List[int],
+    ping_timeout: int,
+    tcp_timeout: float,
+    web_check: bool,
+    web_timeout: float,
+) -> Result:
     hostname, ip, rev, note = resolve(target)
     ping_ok, rtt_ms, ping_note = ping(ip, ping_timeout) if ip else (False, "", "No IP")
 
@@ -167,6 +244,10 @@ def check_one(target: str, ports: List[int], ping_timeout: int, tcp_timeout: flo
         for p in ports:
             if tcp_open(ip, p, tcp_timeout):
                 open_ports.append(str(p))
+
+    web_status, web_error_code = ("", "")
+    if web_check:
+        web_status, web_error_code = check_web_status(ip, open_ports, web_timeout)
 
     notes = note
     if not notes and not ping_ok:
@@ -181,6 +262,8 @@ def check_one(target: str, ports: List[int], ping_timeout: int, tcp_timeout: flo
         rtt_ms=rtt_ms,
         open_ports=",".join(open_ports),
         notes=notes,
+        web_status=web_status,
+        web_error_code=web_error_code,
     )
 
 
@@ -227,6 +310,8 @@ def upsert(inv: Dict[str, Dict[str, str]], results: List[Result]) -> None:
         row["ping_ok"] = str(r.ping_ok)
         row["rtt_ms"] = r.rtt_ms
         row["open_ports"] = r.open_ports
+        row["web_status"] = r.web_status
+        row["web_error_code"] = r.web_error_code
         row["notes"] = r.notes
         row["last_checked"] = now
 
@@ -270,6 +355,19 @@ def main() -> int:
 
     ap.add_argument("--workers", type=int, default=12, help="Parallel workers for file input.")
     ap.add_argument("--inventory", default="netcheck_inventory.csv", help="Inventory CSV path.")
+
+    ap.add_argument(
+        "--web-check",
+        action="store_true",
+        help="[UNDER CONSTRUCTION] Best-effort scrape of the device's web UI (port 443/80) "
+        "for status/error keywords. Experimental, opt-in only.",
+    )
+    ap.add_argument(
+        "--web-timeout",
+        type=float,
+        default=3.0,
+        help="Timeout in seconds for the web UI fetch when --web-check is set (default: 3.0).",
+    )
     args = ap.parse_args()
 
     if args.target:
@@ -289,10 +387,17 @@ def main() -> int:
 
     results: List[Result] = []
     if len(targets) == 1:
-        results.append(check_one(targets[0], ports, args.timeout, tcp_timeout))
+        results.append(
+            check_one(targets[0], ports, args.timeout, tcp_timeout, args.web_check, args.web_timeout)
+        )
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(check_one, t, ports, args.timeout, tcp_timeout): t for t in targets}
+            futs = {
+                ex.submit(
+                    check_one, t, ports, args.timeout, tcp_timeout, args.web_check, args.web_timeout
+                ): t
+                for t in targets
+            }
             for fut in as_completed(futs):
                 results.append(fut.result())
 
@@ -309,10 +414,17 @@ def main() -> int:
         else:
             port_msg = r.open_ports if r.open_ports else "-"
 
+        web_msg = ""
+        if r.web_status:
+            web_msg = f" | web={r.web_status}"
+            if r.web_error_code:
+                web_msg += f" (code {r.web_error_code})"
+
         print(
             f"{key} -> {r.ip} | "
             f"ping={'OK' if r.ping_ok else 'NO'} | "
-            f"ports={port_msg} | "
+            f"ports={port_msg}"
+            f"{web_msg} | "
             f"{r.notes}"
         )
 
