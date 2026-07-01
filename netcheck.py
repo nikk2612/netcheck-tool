@@ -7,7 +7,10 @@ Usage:
     python netcheck.py 192.168.1.50
     python netcheck.py printer-23 --preset printers
 
-  Batch file:
+  CSV of targets (positional, one IP/hostname per row, optional header):
+    python netcheck.py example.csv
+
+  Batch file (plain text, one target per line):
     python netcheck.py --input devices.txt
 
 What it does:
@@ -81,6 +84,38 @@ class Result:
 def read_targets(path: Path) -> List[str]:
     lines = path.read_text(encoding="utf-8").splitlines()
     return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
+# Recognized header names for the first column of a targets CSV (case-insensitive).
+# Includes "device_key" so you can point netcheck.py straight at its own inventory CSV
+# to recheck everything you've tracked so far.
+CSV_HEADER_ALIASES = {
+    "ip", "ip address", "ipaddress", "address", "hostname", "host", "target", "device", "device_key",
+}
+
+
+def read_targets_csv(path: Path) -> List[str]:
+    """
+    Reads a simple targets CSV: one IP/hostname per row, taken from the first
+    non-empty cell of each row. A header row (e.g. "IP", "Hostname") is auto-skipped.
+    Blank rows and rows starting with '#' are ignored.
+    """
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+
+    targets: List[str] = []
+    header_checked = False
+    for row in rows:
+        cell = row[0].strip() if row else ""
+        if not cell or cell.startswith("#"):
+            continue
+        if not header_checked:
+            header_checked = True
+            if cell.lower() in CSV_HEADER_ALIASES:
+                continue
+        targets.append(cell)
+
+    return targets
 
 
 def is_ip(s: str) -> bool:
@@ -254,7 +289,11 @@ def write_inventory_atomic(path: Path, inv: Dict[str, Dict[str, str]]) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="NetCheck (lean) - persistent CSV inventory for quick checks.")
-    ap.add_argument("target", nargs="?", help="Single hostname/IP (positional).")
+    ap.add_argument(
+        "target",
+        nargs="?",
+        help="Single hostname/IP, or a .csv file of targets (one IP/hostname per row, positional).",
+    )
     ap.add_argument("--input", help="File with targets (one per line).")
 
     ap.add_argument("--preset", choices=list(PORT_PRESETS.keys()), default="mixed", help="Port preset to use.")
@@ -273,11 +312,26 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.target:
-        targets = [args.target.strip()]
+        target_arg = args.target.strip()
+        target_path = Path(target_arg)
+
+        if target_path.suffix.lower() == ".csv":
+            if not target_path.exists():
+                # Also check alongside netcheck.py itself, so "python netcheck.py example.csv"
+                # works when the CSV sits next to the script but you ran it from elsewhere.
+                script_dir_path = Path(__file__).resolve().parent / target_arg
+                if script_dir_path.exists():
+                    target_path = script_dir_path
+                else:
+                    print(f"CSV file not found: {target_arg}", file=sys.stderr)
+                    return 2
+            targets = read_targets_csv(target_path)
+        else:
+            targets = [target_arg]
     elif args.input:
         targets = read_targets(Path(args.input))
     else:
-        print("Provide a hostname/IP or --input <file>", file=sys.stderr)
+        print("Provide a hostname/IP, a .csv file of targets, or --input <file>", file=sys.stderr)
         return 2
 
     if not targets:
