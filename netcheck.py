@@ -183,8 +183,12 @@ def fetch_web_page(ip: str, port: int, timeout_s: float) -> str:
     """Best-effort GET of the device's root web page. Raises on any failure."""
     scheme = "https" if port == 443 else "http"
     url = f"{scheme}://{ip}/"
-    # Embedded web UIs (printers, switches) almost always use self-signed certs.
-    ctx = ssl._create_unverified_context() if scheme == "https" else None
+    ctx = None
+    if scheme == "https":
+        # Embedded web UIs (printers, switches) almost always use self-signed certs.
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     req = urllib.request.Request(url, headers={"User-Agent": "NetCheck/1.0"})
     with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:
         raw = resp.read(200_000)  # cap read size, status pages are small
